@@ -82,7 +82,8 @@ object DynamicBrokerConfig {
     DynamicThreadPool.ReconfigurableConfigs ++
     Set(KafkaConfig.MetricReporterClassesProp) ++
     DynamicListenerConfig.ReconfigurableConfigs ++
-    SocketServer.ReconfigurableConfigs
+    SocketServer.ReconfigurableConfigs ++
+    DynamicLeaderDeprioritizedListConfig.ReconfigurableConfigs
 
   private val ClusterLevelListenerConfigs = Set(KafkaConfig.MaxConnectionsProp)
   private val PerBrokerConfigs = DynamicSecurityConfigs  ++
@@ -246,6 +247,7 @@ class DynamicBrokerConfig(private val kafkaConfig: KafkaConfig) extends Logging 
     addBrokerReconfigurable(new DynamicLogConfig(kafkaServer.logManager, kafkaServer))
     addBrokerReconfigurable(new DynamicListenerConfig(kafkaServer))
     addBrokerReconfigurable(kafkaServer.socketServer)
+    addBrokerReconfigurable(new DynamicLeaderDeprioritizedListConfig(kafkaServer))
   }
 
   def addReconfigurable(reconfigurable: Reconfigurable): Unit = CoreUtils.inWriteLock(lock) {
@@ -913,6 +915,42 @@ class DynamicListenerConfig(server: KafkaServer) extends BrokerReconfigurable wi
   private def listenersToMap(listeners: Seq[EndPoint]): Map[ListenerName, EndPoint] =
     listeners.map(e => (e.listenerName, e)).toMap
 
+}
+
+object DynamicLeaderDeprioritizedListConfig {
+  val ReconfigurableConfigs = Set(
+    KafkaConfig.LeaderDeprioritizedListProp)
+}
+
+class DynamicLeaderDeprioritizedListConfig (server: KafkaServer) extends BrokerReconfigurable {
+
+  val leaderDeprioritizedListConfigPattern = """(\d+(:\d+)*)?""".r.pattern
+
+  override def validateReconfiguration(newConfig: KafkaConfig): Unit = {
+    newConfig.values.asScala.filterKeys(DynamicLeaderDeprioritizedListConfig.ReconfigurableConfigs.contains).foreach { case (k, v) =>
+      val newValue = v.asInstanceOf[String]
+      val oldValue = currentValue(k)
+      if (newValue != oldValue) {
+        if (!leaderDeprioritizedListConfigPattern.matcher(newValue).matches)
+          throw new ConfigException(s"Dynamic Leader Deprioritized List failed for $k=$v, value contains invalid characters other than colon and digits. e.g. broker_id1:broker_id2, no spaces.")
+      }
+    }
+  }
+
+  override def reconfigurableConfigs: Set[String] = {
+    DynamicLeaderDeprioritizedListConfig.ReconfigurableConfigs
+  }
+
+  override def reconfigure(oldConfig: KafkaConfig, newConfig: KafkaConfig): Unit = {
+    // Currently, there is noop to reconfigure for this dynamic config leader.deprioritized.list.
+  }
+
+  private def currentValue(name: String): String = {
+    name match {
+      case KafkaConfig.LeaderDeprioritizedListProp => server.config.leaderDeprioritizedList
+      case n => throw new IllegalStateException(s"Unexpected config $n")
+    }
+  }
 }
 
 

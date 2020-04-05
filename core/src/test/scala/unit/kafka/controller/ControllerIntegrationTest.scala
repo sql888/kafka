@@ -18,20 +18,21 @@
 package kafka.controller
 
 import java.util.Properties
-import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue}
+import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
 
 import com.yammer.metrics.Metrics
 import com.yammer.metrics.core.Timer
 import kafka.api.LeaderAndIsr
 import kafka.server.{KafkaConfig, KafkaServer}
-import kafka.utils.TestUtils
+import kafka.utils.{LogCaptureAppender, TestUtils}
 import kafka.zk._
 import org.junit.{After, Before, Test}
 import org.junit.Assert.{assertEquals, assertTrue}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.{ControllerMovedException, StaleBrokerEpochException}
 import org.apache.log4j.Level
-import kafka.utils.LogCaptureAppender
+import org.apache.kafka.clients.admin.{AdminClientConfig, AlterConfigsOptions, Config, ConfigEntry, AdminClient => JAdminClient}
+import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.metrics.KafkaMetric
 import org.scalatest.Assertions.fail
 
@@ -44,6 +45,7 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
   var servers = Seq.empty[KafkaServer]
   val firstControllerEpoch = KafkaController.InitialControllerEpoch + 1
   val firstControllerEpochZkVersion = KafkaController.InitialControllerEpochZkVersion + 1
+  var adminClient: JAdminClient = null
 
   @Before
   override def setUp(): Unit = {
@@ -55,6 +57,30 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
   override def tearDown(): Unit = {
     TestUtils.shutdownServers(servers)
     super.tearDown
+  }
+
+  def createAdminClient(servers: Seq[KafkaServer]): JAdminClient = {
+    val props = new Properties()
+    props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, TestUtils.getBrokerListStrFromServers(servers))
+    props.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000")
+    JAdminClient.create(props)
+  }
+
+  // multiple brokers in the list will be separated by colon :   not by comma ,  and no spaces.  e.g. <broker_id1>:<broker_id2>
+  def setLeaderDeprioritizedList(deprioritizedBrokers: String): Unit = {
+    if (adminClient == null)
+      adminClient = createAdminClient(servers)
+    val alterOptions = new AlterConfigsOptions().timeoutMs(30000).validateOnly(false)
+    // "" means <default>
+    val configResource = new ConfigResource(ConfigResource.Type.BROKER, "")
+    // deprioritized otherBrokerId
+    val leaderDeprioritizedList = Seq(new ConfigEntry(KafkaConfig.LeaderDeprioritizedListProp, deprioritizedBrokers)).asJava
+    adminClient.alterConfigs(Map(configResource -> new Config(leaderDeprioritizedList)).asJava, alterOptions).all().get(60, TimeUnit.SECONDS)
+    if (adminClient != null) {
+      adminClient.close()
+      adminClient = null
+    }
+    TestUtils.waitUntilTrue(() => servers.head.config.leaderDeprioritizedList == deprioritizedBrokers, s"servers.head.config.leaderDeprioritizedList: ${servers.head.config.leaderDeprioritizedList} not the same as deprioritizedBrokers: ${deprioritizedBrokers}")
   }
 
   @Test
@@ -152,7 +178,7 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
 
     // Startup the broker
     testBroker.startup()
-    TestUtils.waitUntilTrue( () => {
+    TestUtils.waitUntilTrue(() => {
       !servers.exists { server =>
         assignment.exists { case (partitionId, replicas) =>
           val partitionInfoOpt = server.metadataCache.getPartitionInfo(topic, partitionId)
@@ -295,7 +321,7 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
     zkClient.createPartitionReassignment(reassignment.mapValues(_.replicas).toMap)
     waitForPartitionState(tp, firstControllerEpoch, otherBrokerId, LeaderAndIsr.initialLeaderEpoch + 3,
       "failed to get expected partition state after partition reassignment")
-    TestUtils.waitUntilTrue(() =>  zkClient.getFullReplicaAssignmentForTopics(Set(tp.topic)) == reassignment,
+    TestUtils.waitUntilTrue(() => zkClient.getFullReplicaAssignmentForTopics(Set(tp.topic)) == reassignment,
       "failed to get updated partition assignment on topic znode after partition reassignment")
     TestUtils.waitUntilTrue(() => !zkClient.reassignPartitionsInProgress(),
       "failed to remove reassign partitions path after completion")
@@ -366,7 +392,7 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
     val assignment = Map(tp.partition -> Seq(otherBroker.config.brokerId, controllerId))
     TestUtils.createTopic(zkClient, tp.topic, partitionReplicaAssignment = assignment, servers = servers)
     preferredReplicaLeaderElection(controllerId, otherBroker, tp, assignment(tp.partition).toSet, LeaderAndIsr.initialLeaderEpoch)
-    preferredReplicaLeaderElection(controllerId, otherBroker, tp, assignment(tp.partition).toSet, LeaderAndIsr.initialLeaderEpoch + 2)
+    preferredReplicaLeaderElection(controllerId, otherBroker, tp, assignment(tp.partition).toSet, LeaderAndIsr.initialLeaderEpoch + 4)
   }
 
   @Test
@@ -384,6 +410,64 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
       "failed to remove preferred replica leader election path after giving up")
     waitForPartitionState(tp, firstControllerEpoch, controllerId, LeaderAndIsr.initialLeaderEpoch + 1,
       "failed to get expected partition state upon broker shutdown")
+
+    // Test dynamic config leader.deprioritized.list
+    servers(otherBrokerId).startup()
+    //Thread.sleep(10000)
+    val newISR = zkClient.getInSyncReplicasForPartition(new TopicPartition(tp.topic, tp.partition)).getOrElse(List()).toSet
+    val oldISR = assignment(tp.partition).toSet
+    System.out.println(s"zkClient.getInSyncReplicasForPartition(new TopicPartition(tp.topic, tp.partition)).getOrElse(List()).toSet:  ${newISR}")
+    System.out.println(s"assignment(tp.partition).toSet:  ${oldISR}")
+    TestUtils.waitUntilTrue(() => zkClient.getInSyncReplicasForPartition(new TopicPartition(tp.topic, tp.partition)).getOrElse(List()).toSet == assignment(tp.partition).toSet, "restarted broker failed to join in-sync replicas")
+    setLeaderDeprioritizedList(s"$otherBrokerId")
+    // Even after otherBrokerId startup and run preferred leader election,
+    // the controllerId will remain as leader because otherBrokerId is deprioritized: leader.deprioritized.list=otherBrokerId
+    System.out.println(s"Run PLE for ${Set(tp)}")
+    zkClient.createPreferredReplicaElection(Set(tp))
+    TestUtils.waitUntilTrue(() => !zkClient.pathExists(PreferredReplicaElectionZNode.path),
+      "failed to remove preferred replica leader election path after giving up")
+    // since the preferred replica is controllerId after setLeaderDeprioritizedList(s"$otherBrokerId")
+    // no PLE has been run, and thus LeaderEpoch remains as LeaderAndIsr.initialLeaderEpoch + 1
+    waitForPartitionState(tp, firstControllerEpoch, controllerId, LeaderAndIsr.initialLeaderEpoch + 1,
+      "failed to get expected partition state upon broker shutdown")
+
+    // Set dynamic config leader.deprioritized.list to empty
+    setLeaderDeprioritizedList("")
+    // the otherBrokerId prefer leader will be elected because leader.deprioritized.list=otherBrokerId is cleared.
+    zkClient.createPreferredReplicaElection(Set(tp))
+    TestUtils.waitUntilTrue(() => !zkClient.pathExists(PreferredReplicaElectionZNode.path),
+      "failed to remove preferred replica leader election path after giving up")
+    waitForPartitionState(tp, firstControllerEpoch, otherBrokerId, LeaderAndIsr.initialLeaderEpoch + 2,
+      "failed to get expected partition state upon broker shutdown")
+  }
+
+  @Test
+  def testPreferredReplicaLeaderElectionWithMultipleDeprioritizedBrokers(): Unit = {
+    servers = makeServers(3, autoLeaderRebalanceEnable = false)
+    val controllerId = TestUtils.waitUntilControllerElected(zkClient)
+    val otherBroker_1 = servers.find(_.config.brokerId != controllerId).get
+    val otherBroker_2 = servers.find(x => x.config.brokerId != controllerId && x.config.brokerId != otherBroker_1.config.brokerId).get
+    val tp = new TopicPartition("t", 0)
+    val assignment = Map(tp.partition -> Seq(otherBroker_1.config.brokerId, controllerId, otherBroker_2.config.brokerId))
+    TestUtils.createTopic(zkClient, tp.topic, partitionReplicaAssignment = assignment, servers = servers)
+
+    // Set 2 brokers in the deprioritzed list, separated by colon :
+    // The 3rd replica in the partition assignment should be elected as leader
+    setLeaderDeprioritizedList(s"${otherBroker_1.config.brokerId}:${controllerId}")
+    zkClient.createPreferredReplicaElection(Set(tp))
+    TestUtils.waitUntilTrue(() => !zkClient.pathExists(PreferredReplicaElectionZNode.path),
+      "failed to remove preferred replica leader election path after giving up")
+    waitForPartitionState(tp, firstControllerEpoch, otherBroker_2.config.brokerId, LeaderAndIsr.initialLeaderEpoch + 1,
+      "failed to get expected partition state after setting multiple LeaderDeprioritizedList")
+
+    // Set all 3 brokers in the deprioritzed list, separated by colon :
+    // The 1st replica in the partition assignment should be elected as leader
+    setLeaderDeprioritizedList(s"${otherBroker_1.config.brokerId}:${otherBroker_2.config.brokerId}:${controllerId}")
+    zkClient.createPreferredReplicaElection(Set(tp))
+    TestUtils.waitUntilTrue(() => !zkClient.pathExists(PreferredReplicaElectionZNode.path),
+      "failed to remove preferred replica leader election path after giving up")
+    waitForPartitionState(tp, firstControllerEpoch, otherBroker_1.config.brokerId, LeaderAndIsr.initialLeaderEpoch + 2,
+      "failed to get expected partition state after setting multiple LeaderDeprioritizedList")
   }
 
   @Test
@@ -401,6 +485,17 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
     servers(otherBrokerId).startup()
     waitForPartitionState(tp, firstControllerEpoch, otherBrokerId, LeaderAndIsr.initialLeaderEpoch + 2,
       "failed to get expected partition state upon broker startup")
+
+    // Test with LeaderDeprioritizedList, AutoPreferredLeaderElection should not happen
+    servers(otherBrokerId).shutdown()
+    servers(otherBrokerId).awaitShutdown()
+    waitForPartitionState(tp, firstControllerEpoch, controllerId, LeaderAndIsr.initialLeaderEpoch + 3,
+      "failed to get expected partition state upon broker shutdown")
+    setLeaderDeprioritizedList(s"$otherBrokerId")
+    servers(otherBrokerId).startup()
+    TestUtils.waitUntilTrue(() => zkClient.getInSyncReplicasForPartition(new TopicPartition(tp.topic, tp.partition)).getOrElse(List()).toSet == assignment(tp.partition).toSet, "restarted broker failed to join in-sync replicas")
+    waitForPartitionState(tp, firstControllerEpoch, controllerId, LeaderAndIsr.initialLeaderEpoch + 3,
+      "failed to get expected partition state upon broker shutdown")
   }
 
   @Test
@@ -445,7 +540,7 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
 
   @Test
   def testControlledShutdown(): Unit = {
-    val expectedReplicaAssignment = Map(0  -> List(0, 1, 2))
+    val expectedReplicaAssignment = Map(0 -> List(0, 1, 2))
     val topic = "test"
     val partition = 0
     // create brokers
@@ -463,14 +558,14 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
     var activeServers = servers.filter(s => s.config.brokerId != 2)
     // wait for the update metadata request to trickle to the brokers
     TestUtils.waitUntilTrue(() =>
-      activeServers.forall(_.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic,partition).get.isr.size != 3),
+      activeServers.forall(_.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic, partition).get.isr.size != 3),
       "Topic test not created after timeout")
     assertEquals(0, partitionsRemaining.size)
-    var partitionStateInfo = activeServers.head.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic,partition).get
+    var partitionStateInfo = activeServers.head.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic, partition).get
     var leaderAfterShutdown = partitionStateInfo.leader
     assertEquals(0, leaderAfterShutdown)
     assertEquals(2, partitionStateInfo.isr.size)
-    assertEquals(List(0,1), partitionStateInfo.isr.asScala)
+    assertEquals(List(0, 1), partitionStateInfo.isr.asScala)
     controller.controlledShutdown(1, servers.find(_.config.brokerId == 1).get.kafkaController.brokerEpoch, controlledShutdownCallback)
     partitionsRemaining = resultQueue.take() match {
       case Success(partitions) => partitions
@@ -478,16 +573,16 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
     }
     assertEquals(0, partitionsRemaining.size)
     activeServers = servers.filter(s => s.config.brokerId == 0)
-    partitionStateInfo = activeServers.head.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic,partition).get
+    partitionStateInfo = activeServers.head.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic, partition).get
     leaderAfterShutdown = partitionStateInfo.leader
     assertEquals(0, leaderAfterShutdown)
 
-    assertTrue(servers.forall(_.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic,partition).get.leader == 0))
+    assertTrue(servers.forall(_.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic, partition).get.leader == 0))
     controller.controlledShutdown(0, servers.find(_.config.brokerId == 0).get.kafkaController.brokerEpoch, controlledShutdownCallback)
     partitionsRemaining = resultQueue.take().get
     assertEquals(1, partitionsRemaining.size)
     // leader doesn't change since all the replicas are shut down
-    assertTrue(servers.forall(_.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic,partition).get.leader == 0))
+    assertTrue(servers.forall(_.dataPlaneRequestProcessor.metadataCache.getPartitionInfo(topic, partition).get.leader == 0))
   }
 
   @Test
@@ -593,8 +688,8 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
     latch.countDown()
     TestUtils.waitUntilTrue(() => {
       otherBroker.replicaManager.partitionCount.value() == 1 &&
-      otherBroker.replicaManager.metadataCache.getAllTopics().size == 1 &&
-      otherBroker.replicaManager.metadataCache.getAliveBrokers.size == 2
+        otherBroker.replicaManager.metadataCache.getAllTopics().size == 1 &&
+        otherBroker.replicaManager.metadataCache.getAliveBrokers.size == 2
     }, "Broker fail to initialize after restart")
   }
 
@@ -652,10 +747,26 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
       "failed to remove preferred replica leader election path after completion")
     waitForPartitionState(tp, firstControllerEpoch, otherBroker.config.brokerId, leaderEpoch + 2,
       "failed to get expected partition state upon broker startup")
+
+    // set leader.deprioritized.list=otherBroker, preferred leader election will go to controllerId
+    setLeaderDeprioritizedList(s"${otherBroker.config.brokerId}")
+    zkClient.createPreferredReplicaElection(Set(tp))
+    TestUtils.waitUntilTrue(() => !zkClient.pathExists(PreferredReplicaElectionZNode.path),
+      "failed to remove preferred replica leader election path after completion")
+    waitForPartitionState(tp, firstControllerEpoch, controllerId, leaderEpoch + 3,
+      "failed to get expected partition state upon broker startup")
+
+    // set leader.deprioritized.list="" empty, preferred leader election will go to otherBroker
+    setLeaderDeprioritizedList("")
+    zkClient.createPreferredReplicaElection(Set(tp))
+    TestUtils.waitUntilTrue(() => !zkClient.pathExists(PreferredReplicaElectionZNode.path),
+      "failed to remove preferred replica leader election path after completion")
+    waitForPartitionState(tp, firstControllerEpoch, otherBroker.config.brokerId, leaderEpoch + 4,
+      "failed to get expected partition state upon broker startup")
   }
 
   private def waitUntilControllerEpoch(epoch: Int, message: String): Unit = {
-    TestUtils.waitUntilTrue(() => zkClient.getControllerEpoch.map(_._1).contains(epoch) , message)
+    TestUtils.waitUntilTrue(() => zkClient.getControllerEpoch.map(_._1).contains(epoch), message)
   }
 
   private def waitForPartitionState(tp: TopicPartition,
@@ -673,10 +784,17 @@ class ControllerIntegrationTest extends ZooKeeperTestHarness {
   private def isExpectedPartitionState(leaderIsrAndControllerEpoch: LeaderIsrAndControllerEpoch,
                                        controllerEpoch: Int,
                                        leader: Int,
-                                       leaderEpoch: Int) =
-    leaderIsrAndControllerEpoch.controllerEpoch == controllerEpoch &&
-      leaderIsrAndControllerEpoch.leaderAndIsr.leader == leader &&
-      leaderIsrAndControllerEpoch.leaderAndIsr.leaderEpoch == leaderEpoch
+                                       leaderEpoch: Int) = {
+  System.out.println(s"leaderIsrAndControllerEpoch.controllerEpoch: ${leaderIsrAndControllerEpoch.controllerEpoch}")
+    System.out.println(s"controllerEpoch: ${controllerEpoch}")
+    System.out.println(s"leaderIsrAndControllerEpoch.leaderAndIsr.leader: ${leaderIsrAndControllerEpoch.leaderAndIsr.leader}")
+    System.out.println(s"leader: ${leader}")
+    System.out.println(s"leaderIsrAndControllerEpoch.controllerEpoch: ${leaderIsrAndControllerEpoch.leaderAndIsr.leaderEpoch}")
+    System.out.println(s"leaderEpoch: ${leaderEpoch}")
+  leaderIsrAndControllerEpoch.controllerEpoch == controllerEpoch &&
+    leaderIsrAndControllerEpoch.leaderAndIsr.leader == leader &&
+    leaderIsrAndControllerEpoch.leaderAndIsr.leaderEpoch == leaderEpoch
+}
 
   private def makeServers(numConfigs: Int,
                           autoLeaderRebalanceEnable: Boolean = false,

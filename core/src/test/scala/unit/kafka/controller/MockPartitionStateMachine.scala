@@ -24,7 +24,8 @@ import org.apache.kafka.common.TopicPartition
 import scala.collection.{Seq, mutable}
 
 class MockPartitionStateMachine(controllerContext: ControllerContext,
-                                uncleanLeaderElectionEnabled: Boolean)
+                                uncleanLeaderElectionEnabled: Boolean,
+                                leaderDeprioritizedList: String = "")
   extends PartitionStateMachine(controllerContext) {
 
   override def handleStateChanges(
@@ -89,13 +90,13 @@ class MockPartitionStateMachine(controllerContext: ControllerContext,
         val partitionsWithUncleanLeaderElectionState = validLeaderAndIsrs.map { case (partition, leaderAndIsr) =>
           (partition, Some(leaderAndIsr), isUnclean || uncleanLeaderElectionEnabled)
         }
-        leaderForOffline(controllerContext, partitionsWithUncleanLeaderElectionState)
+        leaderForOffline(controllerContext, partitionsWithUncleanLeaderElectionState, leaderDeprioritizedList)
       case ReassignPartitionLeaderElectionStrategy =>
-        leaderForReassign(controllerContext, validLeaderAndIsrs)
+        leaderForReassign(controllerContext, validLeaderAndIsrs, leaderDeprioritizedList)
       case PreferredReplicaPartitionLeaderElectionStrategy =>
-        leaderForPreferredReplica(controllerContext, validLeaderAndIsrs)
+        leaderForPreferredReplica(controllerContext, validLeaderAndIsrs, leaderDeprioritizedList)
       case ControlledShutdownPartitionLeaderElectionStrategy =>
-        leaderForControlledShutdown(controllerContext, validLeaderAndIsrs)
+        leaderForControlledShutdown(controllerContext, validLeaderAndIsrs, leaderDeprioritizedList)
     }
 
     val results: Map[TopicPartition, Either[Exception, LeaderAndIsr]] = electionResults.map { electionResult =>

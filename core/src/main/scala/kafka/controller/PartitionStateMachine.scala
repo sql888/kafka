@@ -413,13 +413,13 @@ class ZkPartitionStateMachine(config: KafkaConfig,
           validLeaderAndIsrs,
           allowUnclean
         )
-        leaderForOffline(controllerContext, partitionsWithUncleanLeaderElectionState).partition(_.leaderAndIsr.isEmpty)
+        leaderForOffline(controllerContext, partitionsWithUncleanLeaderElectionState, config.leaderDeprioritizedList).partition(_.leaderAndIsr.isEmpty)
       case ReassignPartitionLeaderElectionStrategy =>
-        leaderForReassign(controllerContext, validLeaderAndIsrs).partition(_.leaderAndIsr.isEmpty)
+        leaderForReassign(controllerContext, validLeaderAndIsrs, config.leaderDeprioritizedList).partition(_.leaderAndIsr.isEmpty)
       case PreferredReplicaPartitionLeaderElectionStrategy =>
-        leaderForPreferredReplica(controllerContext, validLeaderAndIsrs).partition(_.leaderAndIsr.isEmpty)
+        leaderForPreferredReplica(controllerContext, validLeaderAndIsrs, config.leaderDeprioritizedList).partition(_.leaderAndIsr.isEmpty)
       case ControlledShutdownPartitionLeaderElectionStrategy =>
-        leaderForControlledShutdown(controllerContext, validLeaderAndIsrs).partition(_.leaderAndIsr.isEmpty)
+        leaderForControlledShutdown(controllerContext, validLeaderAndIsrs, config.leaderDeprioritizedList).partition(_.leaderAndIsr.isEmpty)
     }
     partitionsWithoutLeaders.foreach { electionResult =>
       val partition = electionResult.topicPartition

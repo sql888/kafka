@@ -389,6 +389,95 @@ class DynamicBrokerConfigTest {
     newprops.put(KafkaConfig.BackgroundThreadsProp, "100")
     dynamicBrokerConfig.updateBrokerConfig(0, newprops)
   }
+
+  @Test
+  def testDynamicLeaderDeprioritizedListConfig(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, port = 9092)
+    val oldConfig =  KafkaConfig.fromProps(props)
+    val kafkaServer: KafkaServer = EasyMock.createMock(classOf[kafka.server.KafkaServer])
+    EasyMock.expect(kafkaServer.config).andReturn(oldConfig).anyTimes()
+    EasyMock.replay(kafkaServer)
+
+    // Default is ""
+    assertEquals("", oldConfig.leaderDeprioritizedList)
+    val singleList = "0"
+    props.put(KafkaConfig.LeaderDeprioritizedListProp, singleList)
+    val newConfig = KafkaConfig(props)
+
+    // call validateReconfiguration() to validate
+    val dynamicLeaderDeprioritizedListConfig = new DynamicLeaderDeprioritizedListConfig(kafkaServer)
+    dynamicLeaderDeprioritizedListConfig.validateReconfiguration(newConfig)
+    val changedConfig = KafkaConfig(props)
+    assertEquals(singleList, changedConfig.leaderDeprioritizedList)
+
+    val zkClient: KafkaZkClient = EasyMock.createMock(classOf[KafkaZkClient])
+    EasyMock.expect(zkClient.getEntityConfigs(EasyMock.anyString(), EasyMock.anyString())).andReturn(new java.util.Properties()).anyTimes()
+    EasyMock.replay(zkClient)
+    val dynamicBrokerConfig = new DynamicBrokerConfig(oldConfig)
+    dynamicBrokerConfig.initialize(zkClient)
+    dynamicBrokerConfig.addBrokerReconfigurable(dynamicLeaderDeprioritizedListConfig)
+
+    // Restore it back to empty
+    val emptyList = ""
+    val newRestoreProps = new Properties()
+    newRestoreProps.put(KafkaConfig.LeaderDeprioritizedListProp, emptyList)
+    val restoreConfig = KafkaConfig(props)
+    restoreConfig.dynamicConfig.updateBrokerConfig(0 , newRestoreProps)
+    assertEquals(emptyList, restoreConfig.leaderDeprioritizedList)
+
+    // Restore it back to empty
+    val multipleList="0:1:2"
+    val newMultipleProps = new Properties()
+    newMultipleProps.put(KafkaConfig.LeaderDeprioritizedListProp, multipleList)
+    val multipleConfig = KafkaConfig(props)
+    multipleConfig.dynamicConfig.updateBrokerConfig(0 , newMultipleProps)
+    assertEquals(multipleList, multipleConfig.leaderDeprioritizedList)
+
+    // Test with Invalid Value
+    val invalidValueProps = new Properties()
+    try {
+      invalidValueProps.put(KafkaConfig.LeaderDeprioritizedListProp, "Invalid_Value")
+      dynamicBrokerConfig.updateBrokerConfig(0, invalidValueProps)
+    } catch {
+      case e: ConfigException => // expected exception
+    }
+
+    // Test with ":100"
+    val startWithColonProps = new Properties()
+    try {
+      startWithColonProps.put(KafkaConfig.LeaderDeprioritizedListProp, ":100")
+      dynamicBrokerConfig.updateBrokerConfig(0, startWithColonProps)
+    } catch {
+      case e: ConfigException => // expected exception
+    }
+
+    // Test with "100:"
+    val endWithColonProps = new Properties()
+    try {
+      endWithColonProps.put(KafkaConfig.LeaderDeprioritizedListProp, "100:")
+      dynamicBrokerConfig.updateBrokerConfig(0, endWithColonProps)
+    } catch {
+      case e: ConfigException => // expected exception
+    }
+
+    // Test with "100::101"
+    val twoConsecutiveColonProps = new Properties()
+    try {
+      twoConsecutiveColonProps.put(KafkaConfig.LeaderDeprioritizedListProp, "100::101")
+      dynamicBrokerConfig.updateBrokerConfig(0, twoConsecutiveColonProps)
+    } catch {
+      case e: ConfigException => // expected exception
+    }
+
+    // Test with ":"
+    val justColonProps = new Properties()
+    try {
+      justColonProps.put(KafkaConfig.LeaderDeprioritizedListProp, ":")
+      dynamicBrokerConfig.updateBrokerConfig(0, justColonProps)
+    } catch {
+      case e: ConfigException => // expected exception
+    }
+  }
 }
 
 class TestDynamicThreadPool() extends BrokerReconfigurable {

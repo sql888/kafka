@@ -22,6 +22,7 @@ import com.yammer.metrics.core.Gauge
 import kafka.admin.AdminOperationException
 import kafka.api._
 import kafka.common._
+import kafka.controller.Election.maybeLeaderDeprioritizedAssignment
 import kafka.controller.KafkaController.{AlterReassignmentsCallback, ElectLeadersCallback, ListReassignmentsCallback}
 import kafka.metrics.{KafkaMetricsGroup, KafkaTimer}
 import kafka.server._
@@ -1794,7 +1795,9 @@ class KafkaController(val config: KafkaConfig,
           electionType match {
             case ElectionType.PREFERRED =>
               val assignedReplicas = controllerContext.partitionReplicaAssignment(partition)
-              val preferredReplica = assignedReplicas.head
+              //val preferredReplica = assignedReplicas.head
+              val assignment = maybeLeaderDeprioritizedAssignment(assignedReplicas, config.leaderDeprioritizedList)
+              val preferredReplica = assignment.head
               val currentLeader = controllerContext.partitionLeadershipInfo(partition).leaderAndIsr.leader
               currentLeader != preferredReplica
 

@@ -114,6 +114,32 @@ class UncleanLeaderElectionTest extends ZooKeeperTestHarness {
   }
 
   @Test
+  def testUncleanLeaderElectionEnabledWithLeaderDeprioritizedList(): Unit = {
+    // enable unclean leader election, leader.deprioritized.list=brokerId1 to deproritize just 1 broker.
+    configProps1.put("unclean.leader.election.enable", "true")
+    configProps1.put("leader.deprioritized.list", s"${brokerId1}")
+    configProps2.put("unclean.leader.election.enable", "true")
+    configProps2.put("leader.deprioritized.list", s"${brokerId1}")
+    startBrokers(Seq(configProps1, configProps2))
+
+    // create topic with 1 partition, 2 replicas, one on each broker
+    TestUtils.createTopic(zkClient, topic, Map(partitionId -> Seq(brokerId1, brokerId2)), servers)
+
+    verifyUncleanLeaderElectionEnabled
+
+    shutdownServers(servers)
+
+    // enable unclean leader election, leader.deprioritized.list=brokerId1:brokerId2 to deproritize both brokers.
+    configProps1.put("unclean.leader.election.enable", "true")
+    configProps1.put("leader.deprioritized.list", s"${brokerId1}:${brokerId2}")
+    configProps2.put("unclean.leader.election.enable", "true")
+    configProps2.put("leader.deprioritized.list", s"${brokerId1}:${brokerId2}")
+    startBrokers(Seq(configProps1, configProps2))
+
+    verifyUncleanLeaderElectionEnabled
+  }
+
+  @Test
   def testUncleanLeaderElectionDisabled(): Unit = {
     // unclean leader election is disabled by default
     startBrokers(Seq(configProps1, configProps2))

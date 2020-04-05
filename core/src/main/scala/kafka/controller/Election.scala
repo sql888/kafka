@@ -25,12 +25,41 @@ case class ElectionResult(topicPartition: TopicPartition, leaderAndIsr: Option[L
 
 object Election {
 
+  /**
+    * Try to elect leaders for multiple partitions.
+    * Electing a leader for a partition updates partition state in zookeeper.
+    *
+    * @param actualAssignment The partition assignment that's in Zookeeper and Controller Context memory, which is not modified.
+    * @return the masked partition assignment where the replicas in the LeaderDeprioritizedList moved to the end of the assignment (lower priority)
+    *
+    *         First filter out the brokers that is in leaderDeprioritizedList, so the ones not in the list gets bubbled up
+    *         to the front of the Seq,  then append the brokers that are in leaderDeprioritizedList to the end,
+    *         thus put them to the lowest priority when determining leadership.
+    *
+    *         if leaderDeprioritizedList is not set (null) or set to empty string ""
+    *         OR all replicas of the partition assignment are in the leaderDeprioritizedList
+    *         return the original partition assignment.
+    *         e.g. assignment = (0,1,2) & leaderDeprioritizedList = (1,2,0), then return original assignment (0,1,2)
+    */
+  def maybeLeaderDeprioritizedAssignment(actualAssignment: Seq[Int], leaderDeprioritizedList: String): Seq[Int] = {
+    // This dynamic config can also be set to empty string "", which is the default setting
+    // To be safe, also take null into consideration and convert it to empty string ""
+    val leaderDeprioritizedListSet = leaderDeprioritizedList.split(":").filter(_ != "").map(_.toInt).toSet
+    System.out.println(s"leaderDeprioritizedListSet: ${leaderDeprioritizedListSet}")
+    System.out.println(s"actualAssignment: ${actualAssignment}")
+    val x = actualAssignment.sortBy(leaderDeprioritizedListSet.contains(_))
+    System.out.println(s"actualAssignment.sortBy(leaderDeprioritizedListSet.contains(_)): ${x}")
+    actualAssignment.sortBy(leaderDeprioritizedListSet.contains(_))
+  }
+
   private def leaderForOffline(partition: TopicPartition,
                                leaderAndIsrOpt: Option[LeaderAndIsr],
                                uncleanLeaderElectionEnabled: Boolean,
-                               controllerContext: ControllerContext): ElectionResult = {
+                               controllerContext: ControllerContext,
+                               leaderDeprioritizedList: String): ElectionResult = {
 
-    val assignment = controllerContext.partitionReplicaAssignment(partition)
+    //val assignment = controllerContext.partitionReplicaAssignment(partition)
+    val assignment = maybeLeaderDeprioritizedAssignment(controllerContext.partitionReplicaAssignment(partition), leaderDeprioritizedList)
     val liveReplicas = assignment.filter(replica => controllerContext.isReplicaOnline(replica, partition))
     leaderAndIsrOpt match {
       case Some(leaderAndIsr) =>
@@ -61,18 +90,21 @@ object Election {
    */
   def leaderForOffline(
     controllerContext: ControllerContext,
-    partitionsWithUncleanLeaderElectionState: Seq[(TopicPartition, Option[LeaderAndIsr], Boolean)]
+    partitionsWithUncleanLeaderElectionState: Seq[(TopicPartition, Option[LeaderAndIsr], Boolean)],
+    leaderDeprioritizedList: String = ""
   ): Seq[ElectionResult] = {
     partitionsWithUncleanLeaderElectionState.map {
       case (partition, leaderAndIsrOpt, uncleanLeaderElectionEnabled) =>
-        leaderForOffline(partition, leaderAndIsrOpt, uncleanLeaderElectionEnabled, controllerContext)
+        leaderForOffline(partition, leaderAndIsrOpt, uncleanLeaderElectionEnabled, controllerContext, leaderDeprioritizedList)
     }
   }
 
   private def leaderForReassign(partition: TopicPartition,
                                 leaderAndIsr: LeaderAndIsr,
-                                controllerContext: ControllerContext): ElectionResult = {
-    val targetReplicas = controllerContext.partitionFullReplicaAssignment(partition).targetReplicas
+                                controllerContext: ControllerContext,
+                                leaderDeprioritizedList: String): ElectionResult = {
+    //val targetReplicas = controllerContext.partitionFullReplicaAssignment(partition).targetReplicas
+    val targetReplicas = maybeLeaderDeprioritizedAssignment(controllerContext.partitionFullReplicaAssignment(partition).targetReplicas, leaderDeprioritizedList)
     val liveReplicas = targetReplicas.filter(replica => controllerContext.isReplicaOnline(replica, partition))
     val isr = leaderAndIsr.isr
     val leaderOpt = PartitionLeaderElectionAlgorithms.reassignPartitionLeaderElection(targetReplicas, isr, liveReplicas.toSet)
@@ -90,16 +122,19 @@ object Election {
    * @return The election results
    */
   def leaderForReassign(controllerContext: ControllerContext,
-                        leaderAndIsrs: Seq[(TopicPartition, LeaderAndIsr)]): Seq[ElectionResult] = {
+                        leaderAndIsrs: Seq[(TopicPartition, LeaderAndIsr)],
+                        leaderDeprioritizedList: String = ""): Seq[ElectionResult] = {
     leaderAndIsrs.map { case (partition, leaderAndIsr) =>
-      leaderForReassign(partition, leaderAndIsr, controllerContext)
+      leaderForReassign(partition, leaderAndIsr, controllerContext, leaderDeprioritizedList)
     }
   }
 
   private def leaderForPreferredReplica(partition: TopicPartition,
                                         leaderAndIsr: LeaderAndIsr,
-                                        controllerContext: ControllerContext): ElectionResult = {
-    val assignment = controllerContext.partitionReplicaAssignment(partition)
+                                        controllerContext: ControllerContext,
+                                        leaderDeprioritizedList: String): ElectionResult = {
+    //val assignment = controllerContext.partitionReplicaAssignment(partition)
+    val assignment = maybeLeaderDeprioritizedAssignment(controllerContext.partitionReplicaAssignment(partition), leaderDeprioritizedList)
     val liveReplicas = assignment.filter(replica => controllerContext.isReplicaOnline(replica, partition))
     val isr = leaderAndIsr.isr
     val leaderOpt = PartitionLeaderElectionAlgorithms.preferredReplicaPartitionLeaderElection(assignment, isr, liveReplicas.toSet)
@@ -117,17 +152,20 @@ object Election {
    * @return The election results
    */
   def leaderForPreferredReplica(controllerContext: ControllerContext,
-                                leaderAndIsrs: Seq[(TopicPartition, LeaderAndIsr)]): Seq[ElectionResult] = {
+                                leaderAndIsrs: Seq[(TopicPartition, LeaderAndIsr)],
+                                leaderDeprioritizedList: String = ""): Seq[ElectionResult] = {
     leaderAndIsrs.map { case (partition, leaderAndIsr) =>
-      leaderForPreferredReplica(partition, leaderAndIsr, controllerContext)
+      leaderForPreferredReplica(partition, leaderAndIsr, controllerContext, leaderDeprioritizedList)
     }
   }
 
   private def leaderForControlledShutdown(partition: TopicPartition,
                                           leaderAndIsr: LeaderAndIsr,
                                           shuttingDownBrokerIds: Set[Int],
-                                          controllerContext: ControllerContext): ElectionResult = {
-    val assignment = controllerContext.partitionReplicaAssignment(partition)
+                                          controllerContext: ControllerContext,
+                                          leaderDeprioritizedList: String): ElectionResult = {
+    //val assignment = controllerContext.partitionReplicaAssignment(partition)
+    val assignment = maybeLeaderDeprioritizedAssignment(controllerContext.partitionReplicaAssignment(partition), leaderDeprioritizedList)
     val liveOrShuttingDownReplicas = assignment.filter(replica =>
       controllerContext.isReplicaOnline(replica, partition, includeShuttingDownBrokers = true))
     val isr = leaderAndIsr.isr
@@ -148,10 +186,11 @@ object Election {
    * @return The election results
    */
   def leaderForControlledShutdown(controllerContext: ControllerContext,
-                                  leaderAndIsrs: Seq[(TopicPartition, LeaderAndIsr)]): Seq[ElectionResult] = {
+                                  leaderAndIsrs: Seq[(TopicPartition, LeaderAndIsr)],
+                                  leaderDeprioritizedList: String = ""): Seq[ElectionResult] = {
     val shuttingDownBrokerIds = controllerContext.shuttingDownBrokerIds.toSet
     leaderAndIsrs.map { case (partition, leaderAndIsr) =>
-      leaderForControlledShutdown(partition, leaderAndIsr, shuttingDownBrokerIds, controllerContext)
+      leaderForControlledShutdown(partition, leaderAndIsr, shuttingDownBrokerIds, controllerContext, leaderDeprioritizedList)
     }
   }
 }
